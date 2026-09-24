@@ -533,7 +533,7 @@ class SurfaceGroup:
                 Default is 'air'.
             **kwargs: Additional keyword arguments for surface-specific
                 parameters such as radius, conic, dx, dy, rx, ry, rz, aperture,
-                bsdf, x, y, z.
+                bsdf, x, y, z, mirror_thickness.
 
         Raises:
             ValueError: If a new surface is provided and no index is given.
@@ -611,6 +611,16 @@ class SurfaceGroup:
         if new_surface.is_stop:
             for idx, surface in enumerate(self._surfaces):
                 surface.is_stop = idx == index
+
+        mirror_thickness = kwargs.get("mirror_thickness")
+        if mirror_thickness is not None:
+            if not new_surface.interaction_model.is_reflective:
+                raise ValueError("mirror_thickness requires a reflective surface.")
+            if not be.isfinite(mirror_thickness) or mirror_thickness < 0:
+                raise ValueError(
+                    "mirror_thickness must be a finite, non-negative number."
+                )
+            new_surface.mirror_thickness = float(mirror_thickness)
 
     def remove(self, index):
         """Remove a surface from the list of surfaces.

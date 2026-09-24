@@ -219,6 +219,8 @@ class OpticUpdater:
         for surf_idx in range(num_surfaces):
             surface = self.optic.surfaces[surf_idx]
             surface.geometry.scale(scale_factor)
+            if surface.mirror_thickness is not None:
+                surface.mirror_thickness *= scale_factor
 
             if surf_idx != num_surfaces - 1 and not be.isinf(thicknesses[surf_idx]):
                 self.set_thickness(thicknesses[surf_idx] * scale_factor, surf_idx)

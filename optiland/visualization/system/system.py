@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import optiland.backend as be
 from optiland.visualization.system.lens import Lens2D, Lens3D
-from optiland.visualization.system.mirror import Mirror3D
+from optiland.visualization.system.mirror import Mirror2D, Mirror3D
 from optiland.visualization.system.surface import Surface2D, Surface3D
 from optiland.visualization.system.utils import transform
 
@@ -84,7 +84,7 @@ class OpticalSystem:
 
         self.component_registry = {
             "lens": {"2d": Lens2D, "3d": Lens3D},
-            "mirror": {"2d": Surface2D, "3d": Mirror3D},
+            "mirror": {"2d": Mirror2D, "3d": Mirror3D},
             "surface": {"2d": Surface2D, "3d": Surface3D},
         }
 
@@ -143,6 +143,7 @@ class OpticalSystem:
         num_surf = self.optic.surfaces.num_surfaces
 
         lens_surfaces = []
+        path = None
 
         for k, surf in enumerate(self.optic.surfaces):
             extent = self.rays.r_extent[k]
@@ -162,7 +163,14 @@ class OpticalSystem:
 
             # Surface is a mirror
             elif surf.interaction_model.is_reflective:
-                lens_surfaces = self._add_mirror_component(surf, extent, lens_surfaces)
+                backing_sign = 1.0
+                if surf.mirror_thickness:
+                    if path is None:
+                        path = self.optic.surfaces.build_paraxial_path()
+                    backing_sign = -1.0 if path.axis_alignments[k] < 0 else 1.0
+                lens_surfaces = self._add_mirror_component(
+                    surf, extent, lens_surfaces, backing_sign
+                )
 
             # Front or back surface of a lens
             elif n[k] > 1 or (n[k] == 1 and n[k - 1] > 1 and lens_surfaces):
@@ -178,7 +186,9 @@ class OpticalSystem:
         if lens_surfaces:
             self._add_component("lens", lens_surfaces)
 
-    def _add_mirror_component(self, surf, extent, lens_surfaces: list) -> list:
+    def _add_mirror_component(
+        self, surf, extent, lens_surfaces: list, backing_sign: float = 1.0
+    ) -> list:
         """Add a standalone mirror, or close out a second-surface mirror lens.
 
         Returns the (possibly reset) `lens_surfaces` accumulator.
@@ -187,7 +197,7 @@ class OpticalSystem:
             lens_surfaces.append(self._get_lens_surface(surf, extent))
             self._add_component("lens", lens_surfaces)
             return []
-        self._add_component("mirror", surf, extent)
+        self._add_component("mirror", surf, extent, backing_sign=backing_sign)
         return lens_surfaces
 
     def _add_lens_edge_component(

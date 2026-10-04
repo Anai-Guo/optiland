@@ -323,6 +323,7 @@ class TestBaseMaterialTorchCaching:
 
     @pytest.fixture(autouse=True)
     def _setup_torch(self):
+        pytest.importorskip("torch")
         be.set_backend("torch")
         be.set_device("cpu")
         be.grad_mode.enable()
@@ -807,6 +808,7 @@ class TestMaterialFile:
         material = materials.MaterialFile(filename)
         assert material.to_dict() == {
             "filename": filename,
+            "bounds": "clamp",
             "type": materials.MaterialFile.__name__,
             "propagation_model": {"class": "HomogeneousPropagation"},
         }
@@ -883,6 +885,7 @@ class TestMaterial:
         mat_dict = material.to_dict()
         assert mat_dict == {
             "type": "Material",
+            "bounds": "clamp",
             "filename": material.filename,
             "name": "SF11",
             "reference": None,

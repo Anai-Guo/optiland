@@ -154,6 +154,7 @@ class Surface(ObserverMixin):
             self.interaction_model.parent_surface = self
 
         self.thickness = 0.0  # used for surface positioning
+        self.mirror_thickness: float | None = None  # mechanical drawing only
         ObserverMixin.__init__(self)
         self.reset()
 

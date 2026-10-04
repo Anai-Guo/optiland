@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import QEvent, Qt, QTimer, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 
 from . import gui_plot_utils
 from .analysis_panel import CustomMatplotlibToolbar
+from .layout_highlighting import LayoutHighlightController
 from .layout_presenter import present_2d, present_3d, present_sag
 from .widgets.layout_job_view import LayoutJobView
 
@@ -159,7 +160,7 @@ class SagViewer(QWidget):
         self.layout_job = LayoutJobView(
             self, "sag", plot_layout, self._layout_parameters, self._present_layout
         )
-        self.connector.opticChanged.connect(self.update_surface_range)
+        self.connector.document_state.committed.connect(self._on_document_change)
         self.update_surface_range()
         self.layout_job.redraw()
         self.update_theme()
@@ -208,6 +209,10 @@ class SagViewer(QWidget):
         """Updates the range of the surface selector spinbox."""
         count = self.connector.get_surface_count()
         self.surface_selector.setRange(0, max(0, count - 1))
+
+    def _on_document_change(self, change):
+        if change.structural:
+            self.update_surface_range()
 
     def update_theme(self, theme="dark"):
         self.current_theme = theme
@@ -274,8 +279,9 @@ class ViewerPanel(QWidget):
 
         main_layout.addWidget(self.tabWidget)
 
-        self.connector.opticLoaded.connect(self.update_viewers)
-        self.connector.opticChanged.connect(self.update_viewers)
+        # Each LayoutJobView owns immediate optical invalidation and coalesced
+        # visible requests. Public Loaded/Changed signals must not request a
+        # synchronous duplicate while a classified transaction is still open.
 
     def _create_2d_viewer_tab(self):
         """Creates the container widget for the 2D viewer, including its toolbar."""
@@ -289,12 +295,16 @@ class ViewerPanel(QWidget):
         self.preserve_zoom_checkbox.setToolTip(
             "Lock the current zoom and pan level when the system updates."
         )
+        self.preserve_zoom_checkbox.toggled.connect(self._set_preserve_zoom)
         toolbar_layout.addWidget(self.preserve_zoom_checkbox)
         toolbar_layout.addStretch()
 
         layout.addLayout(toolbar_layout)
         layout.addWidget(self.viewer2D)
         return container
+
+    def _set_preserve_zoom(self, checked):
+        self.viewer2D.preserve_zoom = checked
 
     @Slot()
     def update_viewers(self):
@@ -370,6 +380,9 @@ class MatplotlibViewer(QWidget):
         self.canvas = FigureCanvas(self.figure)
         plot_layout.addWidget(self.canvas)
         self.ax = self.figure.add_subplot(111)
+        self.interaction_state = None
+        self.highlight_controller = None
+        self._highlight_bindings = None
 
         self._is_plotting = False
         self._user_initiated_view_change = False
@@ -440,8 +453,11 @@ class MatplotlibViewer(QWidget):
         self._pan_start_x = None
         self._pan_start_y = None
         self._is_panning = False
+        self._pan_moved = False
+        self.canvas.installEventFilter(self)
 
         self._preserve_next = False
+        self.preserve_zoom = False
         self.layout_job = LayoutJobView(
             self, "2d", self.layout, self._layout_parameters, self._present_layout
         )
@@ -458,7 +474,9 @@ class MatplotlibViewer(QWidget):
         self._user_initiated_view_change = False
         self._preserve_next = False
         if self.layout_job.data is not None:
-            self._present_layout(self.layout_job.data, self.layout_job.context)
+            self._present_layout(
+                self.layout_job.data, self.layout_job.context, reset=True
+            )
         else:
             self.layout_job.request()
 
@@ -469,10 +487,19 @@ class MatplotlibViewer(QWidget):
         Args:
             event: The Matplotlib mouse button press event.
         """
-        if event.button == 1 and event.inaxes:  # Left mouse button
+        if (
+            event.button == 1
+            and event.inaxes is self.ax
+            and event.xdata is not None
+            and event.ydata is not None
+            and self._default_pan_available()
+        ):
+            self._finish_default_pan()
+            self.toolbar.push_current()
             self._pan_start_x = event.xdata
             self._pan_start_y = event.ydata
             self._is_panning = True
+            self._pan_moved = False
             self.canvas.setCursor(
                 Qt.ClosedHandCursor
             )  # Change cursor to indicate panning
@@ -484,11 +511,34 @@ class MatplotlibViewer(QWidget):
         Args:
             event: The Matplotlib mouse button release event.
         """
-        if event.button == 1:  # Left mouse button
-            self._is_panning = False
-            self._pan_start_x = None
-            self._pan_start_y = None
-            self.canvas.setCursor(Qt.ArrowCursor)  # Reset cursor
+        if event.button == 1:
+            self._finish_default_pan()
+
+    def _default_pan_available(self) -> bool:
+        """Leave toolbar and interactive-widget gestures to their owner."""
+        return not self.toolbar.mode and self.canvas.widgetlock.available(self)
+
+    def _finish_default_pan(self) -> None:
+        """End only our own drag, without replacing a toolbar tool's cursor."""
+        if not self._is_panning:
+            return
+        self._is_panning = False
+        self._pan_start_x = None
+        self._pan_start_y = None
+        if self._pan_moved:
+            self.toolbar.push_current()
+        self._pan_moved = False
+        if self._default_pan_available():
+            self.canvas.unsetCursor()
+
+    def eventFilter(self, watched, event):
+        """Discard an interrupted custom drag while preserving normal Qt events."""
+        if watched is self.canvas and (
+            event.type() in (QEvent.FocusOut, QEvent.Hide, QEvent.WindowDeactivate)
+            or (event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape)
+        ):
+            self._finish_default_pan()
+        return super().eventFilter(watched, event)
 
     def on_mouse_move_on_plot(self, event):
         """
@@ -497,7 +547,15 @@ class MatplotlibViewer(QWidget):
         Args:
             event: The Matplotlib motion notify event.
         """
-        if self._is_panning and event.inaxes and self._pan_start_x is not None:
+        if self._is_panning and not self._default_pan_available():
+            self._finish_default_pan()
+
+        has_coordinates = (
+            event.inaxes is self.ax
+            and event.xdata is not None
+            and event.ydata is not None
+        )
+        if self._is_panning and has_coordinates and self._pan_start_x is not None:
             # Calculate the distance moved
             dx = self._pan_start_x - event.xdata
             dy = self._pan_start_y - event.ydata
@@ -510,13 +568,14 @@ class MatplotlibViewer(QWidget):
             # Update the limits by the distance moved
             ax.set_xlim(xlim[0] + dx, xlim[1] + dx)
             ax.set_ylim(ylim[0] + dy, ylim[1] + dy)
+            self._pan_moved = self._pan_moved or dx != 0 or dy != 0
 
             # Redraw the canvas
             self.canvas.draw_idle()
             return  # Skip the coordinate display when panning
 
         # Original coordinate display code
-        if event.inaxes:
+        if has_coordinates:
             x_coord = f"{event.xdata:.3f}"
             y_coord = f"{event.ydata:.3f}"
             self.cursor_coord_label.setText(f"(Z, Y) = ({x_coord}, {y_coord})")
@@ -570,17 +629,51 @@ class MatplotlibViewer(QWidget):
             self.layout_job.redraw()
         self.settings_toggle_btn.setIcon(QIcon(f":/icons/{theme}/settings.svg"))
 
+    def set_interaction_state(self, state):
+        """Attach shared editor state without recomputing the existing scene."""
+        if self.highlight_controller is not None:
+            self.interaction_state.changed.disconnect(self.highlight_controller.apply)
+            self.highlight_controller.clear()
+            self.highlight_controller.deleteLater()
+        self.interaction_state = state
+        self.highlight_controller = LayoutHighlightController(
+            self.ax, self.canvas, state, lambda: self.current_theme
+        )
+        if self._highlight_bindings is not None:
+            self.install_2d_highlight_bindings(*self._highlight_bindings)
+
+    def clear_2d_highlights(self):
+        """Forget artist references before replacing the axes contents."""
+        self._highlight_bindings = None
+        if self.highlight_controller is not None:
+            self.highlight_controller.clear()
+
+    def install_2d_highlight_bindings(
+        self, body_artists, surface_artists, boundary_coordinates, reference_coordinates
+    ):
+        """Install GUI-local ownership of an accepted worker-prepared scene."""
+        self._highlight_bindings = (
+            body_artists,
+            surface_artists,
+            boundary_coordinates,
+            reference_coordinates,
+        )
+        if self.highlight_controller is not None:
+            self.interaction_state.sync_document(self.connector.get_optic())
+            self.highlight_controller.install_bindings(*self._highlight_bindings)
+
     def _layout_parameters(self):
         return {
             "num_rays": self.num_rays_spinbox.value(),
             "distribution": self.dist_combo.currentText(),
         }
 
-    def _present_layout(self, data, context, restyle=False):
-        present_2d(self, data, context, restyle)
+    def _present_layout(self, data, context, restyle=False, *, reset=False):
+        present_2d(self, data, context, restyle, reset=reset)
 
     def plot_optic(self, preserve_zoom=False):
         """Request the latest visible layout; calculation belongs to its worker."""
+        self._finish_default_pan()
         self._preserve_next = bool(preserve_zoom)
         self.layout_job.request()
 
